@@ -18,6 +18,7 @@ const uint16_t MQTT_PORT = 9501;
 
 Servo wallSwitch;
 int currentAngle = ANGLE_ON;  // 上电即在"开"位置
+bool switchIsOn = true;      // 开关当前状态，与舵机角度分开维护
 
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
@@ -30,16 +31,22 @@ static void moveTo(int target) {
   delay(delta * 2 + 50);
 }
 
-// 拨动开关：状态相同时直接忽略，避免反复顶住机械结构
+// 拨动开关。只有状态真的变化时才动作、才上报。
+// 关键：巴法云会把设备 publish 的消息回推给同一主题的订阅者（也就是设备自己），
+// 所以"状态没变就不上报"是切断回环、避免指令无限往返的必要条件。
 static void setSwitch(bool on) {
-  int target = on ? ANGLE_ON : ANGLE_OFF;
-  if (currentAngle == target) {
+  if (switchIsOn == on) {
     Serial.printf("already %s\n", on ? "on" : "off");
     return;
   }
+  switchIsOn = on;
+
+  int target = on ? ANGLE_ON : ANGLE_OFF;
   Serial.printf("switch %s: %d -> %d deg\n", on ? "on" : "off", currentAngle, target);
   moveTo(target);
   Serial.printf("hold at %d deg\n", target);
+
+  mqtt.publish(BEMFA_TOPIC, on ? "on" : "off");  // 上报状态给小爱/米家
 }
 
 // 巴法云下发内容形如 "on" / "off" / "on#xx"，只取 # 之前的部分
@@ -53,6 +60,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
   if (extra != nullptr) {
     *extra = '\0';
   }
+  Serial.printf("recv: %s\n", msg);
 
   if (strcasecmp(msg, "on") == 0) {
     setSwitch(true);
