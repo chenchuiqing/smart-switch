@@ -9,16 +9,20 @@
 // 信号线接 GPIO18；舵机电源由外部 5V 独立供电，且必须与 ESP32 共地
 const int SERVO_PIN = 18;
 
-const int ANGLE_OFF = 30;   // "关"位置
-const int ANGLE_ON = 120;   // "开"位置
+const int ANGLE_OFF = 50;    // "关"位置 越小越靠里面
+const int ANGLE_REST = 85;   // 拨完关灯后的归位角度（介于开/关之间），松开开关，不阻碍手动操作
 
 // 巴法云 MQTT 设备云：明文端口 9501，clientID 必须填私钥
 const char* MQTT_HOST = "bemfa.com";
 const uint16_t MQTT_PORT = 9501;
 
 Servo wallSwitch;
-int currentAngle = ANGLE_ON;  // 上电即在"开"位置
-bool switchIsOn = true;      // 开关当前状态，与舵机角度分开维护
+int currentAngle = ANGLE_REST;
+
+// 巴法云会把设备 publish 的消息回推给订阅者（也就是设备自己），
+// 用时间窗丢弃这条回声，避免同一条"off"被反复执行。
+const uint32_t ECHO_GUARD_MS = 3000;
+uint32_t suppressUntilMs = 0;
 
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
@@ -31,22 +35,14 @@ static void moveTo(int target) {
   delay(delta * 2 + 50);
 }
 
-// 拨动开关。只有状态真的变化时才动作、才上报。
-// 关键：巴法云会把设备 publish 的消息回推给同一主题的订阅者（也就是设备自己），
-// 所以"状态没变就不上报"是切断回环、避免指令无限往返的必要条件。
-static void setSwitch(bool on) {
-  if (switchIsOn == on) {
-    Serial.printf("already %s\n", on ? "on" : "off");
-    return;
-  }
-  switchIsOn = on;
+// 只做关灯：先拨到关位，再退回待机角度，让开关松手，用户仍可手动开/关
+static void turnOff() {
+  Serial.printf("off: %d -> %d deg\n", currentAngle, ANGLE_OFF);
+  moveTo(ANGLE_OFF);
+  moveTo(ANGLE_REST);
 
-  int target = on ? ANGLE_ON : ANGLE_OFF;
-  Serial.printf("switch %s: %d -> %d deg\n", on ? "on" : "off", currentAngle, target);
-  moveTo(target);
-  Serial.printf("hold at %d deg\n", target);
-
-  mqtt.publish(BEMFA_TOPIC, on ? "on" : "off");  // 上报状态给小爱/米家
+  suppressUntilMs = millis() + ECHO_GUARD_MS;
+  mqtt.publish(BEMFA_TOPIC, "off");  // 上报状态给小爱/米家
 }
 
 // 巴法云下发内容形如 "on" / "off" / "on#xx"，只取 # 之前的部分
@@ -62,12 +58,14 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int len) {
   }
   Serial.printf("recv: %s\n", msg);
 
-  if (strcasecmp(msg, "on") == 0) {
-    setSwitch(true);
-  } else if (strcasecmp(msg, "off") == 0) {
-    setSwitch(false);
+  if (strcasecmp(msg, "off") == 0) {
+    if (millis() < suppressUntilMs) {  // 自己上报的回声，丢弃
+      Serial.println("echo ignored");
+      return;
+    }
+    turnOff();
   } else {
-    Serial.printf("unknown msg: %s\n", msg);
+    Serial.printf("ignored msg: %s (only off supported)\n", msg);
   }
 }
 
@@ -87,7 +85,7 @@ static void ensureConnected() {
     mqtt.subscribe(BEMFA_TOPIC);
     Serial.print("subscribed ");
     Serial.println(BEMFA_TOPIC);
-    mqtt.publish(BEMFA_TOPIC, currentAngle == ANGLE_ON ? "on" : "off");  // 上线同步状态
+    // 开关可被用户手动拨动，上电时真实状态未知，因此不做状态同步上报
   } else {
     Serial.printf("failed, rc=%d\n", mqtt.state());
   }
@@ -95,12 +93,10 @@ static void ensureConnected() {
 
 // 串口调试指令，云平台接好后仍保留，方便现场排查
 static void processCommand(const char* cmd) {
-  if (strcasecmp(cmd, "on") == 0) {
-    setSwitch(true);
-  } else if (strcasecmp(cmd, "off") == 0) {
-    setSwitch(false);
+  if (strcasecmp(cmd, "off") == 0) {
+    turnOff();
   } else {
-    Serial.printf("unknown command: %s (use on / off)\n", cmd);
+    Serial.printf("ignored command: %s (only off supported)\n", cmd);
   }
 }
 
@@ -147,11 +143,11 @@ void setup() {
   Serial.println();
   Serial.println("=== smart switch ready ===");
   Serial.printf("signal pin : GPIO%d\n", SERVO_PIN);
-  Serial.printf("angles     : off %d deg, on %d deg\n", ANGLE_OFF, ANGLE_ON);
-  Serial.println("commands   : on / off");
+  Serial.printf("angles     : off %d deg, rest %d deg\n", ANGLE_OFF, ANGLE_REST);
+  Serial.println("commands   : off");
 
   wallSwitch.attach(SERVO_PIN);
-  wallSwitch.write(ANGLE_ON);  // 上电直接停在"开"位置
+  wallSwitch.write(ANGLE_REST);  // 上电停在待机角度，不压住开关
 
   connectWiFi();
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
